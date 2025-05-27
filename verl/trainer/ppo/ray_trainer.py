@@ -60,6 +60,7 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
+from tensordict import TensorDict
 
 WorkerType = Type[Worker]
 
@@ -337,6 +338,7 @@ class RayPPOTrainer:
 
         self._validate_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+        self.diverse_prompt_n = 1
 
     def _validate_config(self):
         config = self.config
@@ -851,7 +853,122 @@ class RayPPOTrainer:
         batch.reorder(global_idx)
         global_balance_stats = log_seqlen_unbalance(seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix)
         metrics.update(global_balance_stats)
+        
+    def _repeat_non_tensor_batch(self, non_tensor_batch, repeat_times):
+        new_non_tensor_batch = {}
+        for k, v in non_tensor_batch.items():
+            # 假设 v 是 list 或 np.array，按 batch 维度 repeat
+            if isinstance(v, np.ndarray):
+                new_non_tensor_batch[k] = np.repeat(v, repeat_times, axis=0)
+            elif isinstance(v, list):
+                new_non_tensor_batch[k] = sum([[item] * repeat_times for item in v], [])
+            else:
+                new_non_tensor_batch[k] = v  # 其他类型直接复制
+        return new_non_tensor_batch
+    
+    def construct_diverse_prompt(self, gen_batch):
+        """
+        Construct diverse prompts for the given batch.
+        
+        batch: ['input_ids', 'attention_mask', 'position_ids']
+        
+        """
+        self.diverse_prompt_n = gen_batch.batch["diverse_input_ids"].shape[1]
+        
+        # 8,6,128 -> 8*6,128
+        new_batch = TensorDict(
+            input_ids=gen_batch.batch["diverse_input_ids"].view(gen_batch.batch["diverse_input_ids"].shape[0] * self.diverse_prompt_n, -1),
+            attention_mask=gen_batch.batch["diverse_attention_mask"].view(gen_batch.batch["diverse_attention_mask"].shape[0] * self.diverse_prompt_n, -1),
+            position_ids=gen_batch.batch["diverse_position_ids"].view(gen_batch.batch["diverse_position_ids"].shape[0] * self.diverse_prompt_n, -1),
+            batch_size=gen_batch.batch["input_ids"].shape[0] * self.diverse_prompt_n
+        )
+        
+        new_non_tensor_batch = self._repeat_non_tensor_batch(gen_batch.non_tensor_batch, self.diverse_prompt_n)
+        new_gen_batch = DataProto(batch=new_batch, non_tensor_batch=new_non_tensor_batch)
+        
+        return new_gen_batch
+    
+    def cartesian_product(self, batch: DataProto):
+        """
+        Compute the cartesian product of the given batch.
+        
+        batch: 
+            input_ids, attention_mask, position_ids
+            prompts, responses
+        non_tensor_batch:
+            tools_kwargs: {}
+        
+        Return:
+            diverse prompt1, roll1
+            diverse prompt1, roll2
+            diverse prompt1, roll3
+            diverse prompt1, roll4
+            diverse prompt2, roll1
+            diverse prompt2, roll2
+            diverse prompt2, roll3
+            diverse prompt2, roll4
+        
+        m diverse_prompt
+        n rollout
+        k batch size
+        
+        get m^2 * n responses
+        """
+        prompt_len = self.config.data.get('max_prompt_length', 128) + 1024
+        response_len = self.config.data.get('max_response_length', 128)
+        batch_size = k = self.config.data.get('train_batch_size', 1)
+        m = self.diverse_prompt_n
+        n = self.config.actor_rollout_ref.rollout.n
+        
+        prompts = batch.batch.pop('prompts')
+        responses = batch.batch.pop('responses')
 
+        def _cartesian_product(tensor, prompt_len, response_len):
+            a, b = torch.split(tensor, [prompt_len, response_len], dim=-1)
+            
+            # 1. 交换 m 和 n 维度，使 n 变成 batch 内部批次
+            a = a.permute(0, 2, 1, 3)  # (k, n, m, d1)
+            b = b.permute(0, 2, 1, 3)  # (k, n, m, d2)
+
+
+            # 2. 做笛卡尔积：对 m 维做 m×m 拼接
+            a_exp = a.unsqueeze(3)          # (k, n, m, 1, d1)
+            b_exp = b.unsqueeze(2)          # (k, n, 1, m, d2)
+            a_tile = a_exp.expand(-1, -1, m, m, -1)  # (k, n, m, m, d1)
+            b_tile = b_exp.expand(-1, -1, m, m, -1)  # (k, n, m, m, d2)
+
+            # 3. 拼接 + reshape
+            out = torch.cat([a_tile, b_tile], dim=-1)      # (k, n, m, m, 3072)
+            out = out.reshape(k* n * m * m, prompt_len + response_len)        # (k, m^2 n, 3072)
+            return out
+            
+
+        kmn_batch = batch.batch.view((k,m,n)) # (batch_size, m*n, seq_len)
+
+        input_ids, attention_mask, position_ids = kmn_batch.pop('input_ids'), kmn_batch.pop('attention_mask'), kmn_batch.pop('position_ids')
+
+        new_input_ids = _cartesian_product(input_ids, prompt_len, response_len)
+        new_attention_mask = _cartesian_product(attention_mask, prompt_len, response_len)
+        new_position_ids = _cartesian_product(position_ids, prompt_len, response_len)
+
+        prompts, responses = torch.split(new_input_ids, [prompt_len, response_len], dim=-1)
+
+        new_non_tensor_batch = self._repeat_non_tensor_batch(batch.non_tensor_batch, m)
+        new_gen_batch = DataProto(
+            batch=TensorDict(
+                {
+                    "input_ids": new_input_ids,
+                    "attention_mask": new_attention_mask,
+                    "position_ids": new_position_ids,
+                    "prompts": prompts,
+                    "responses": responses,
+                },
+            batch_size=k*m*m*n
+            ),
+            non_tensor_batch=new_non_tensor_batch
+        )
+        return new_gen_batch
+        
     def fit(self):
         """
         The training loop of PPO.
@@ -907,6 +1024,8 @@ class RayPPOTrainer:
                     non_tensor_batch_keys_to_pop.append("raw_prompt")
                 if "tools_kwargs" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("tools_kwargs")
+                if "diverse_input_ids" in batch.batch:
+                    batch_keys_to_pop.extend(["diverse_input_ids", "diverse_attention_mask", "diverse_position_ids"])
                 gen_batch = batch.pop(
                     batch_keys=batch_keys_to_pop,
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
@@ -917,6 +1036,8 @@ class RayPPOTrainer:
                 with _timer("step", timing_raw):
                     # generate a batch
                     with _timer("gen", timing_raw):
+                        if self.config.data.get('diverse_prompt', False):
+                            gen_batch = self.construct_diverse_prompt(gen_batch)
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         else:
@@ -924,6 +1045,9 @@ class RayPPOTrainer:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
                             self.async_rollout_manager.sleep()
 
+                    if self.config.data.get('diverse_prompt', False):
+                        gen_batch_output = self.cartesian_product(gen_batch_output)
+                        
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with _timer("gen_max", timing_raw):
                             gen_baseline_batch = deepcopy(gen_batch)
@@ -942,7 +1066,7 @@ class RayPPOTrainer:
 
                     batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
                     # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n * self.diverse_prompt_n * self.diverse_prompt_n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
                     batch.batch["response_mask"] = compute_response_mask(batch)

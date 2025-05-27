@@ -94,6 +94,15 @@ class RLHFDataset(Dataset):
         self.serialize_dataset = False
         self._download()
         self._read_files_and_tokenize()
+        
+        self.diverse_prompt = [
+            "You are a helpful assistant. ",
+            "You are a math expert. ",
+            "You are a physics expert. ",
+            "You are a biology expert. ",
+            "You are a history expert. ",
+            "You are a literature expert. ",
+        ]
 
     def _download(self, use_origin_parquet=False):
         from verl.utils.fs import copy_to_local
@@ -260,6 +269,31 @@ class RLHFDataset(Dataset):
             logger.warning("tools_kwargs is empty for index {}, data source: {}", index, row_dict["data_source"])
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
+        
+        if self.config.get("diverse_prompt", False):
+            raw_messages = messages.copy()
+            diverse_prompts = []
+            for prompt in self.diverse_prompt:
+                diverse_prompts.append([{"role": "user", "content": prompt + raw_messages[-1]["content"]}])
+
+            raw_diverse_prompt = self.tokenizer.apply_chat_template(diverse_prompts, add_generation_prompt=True, tokenize=False)
+            
+            diverse_model_inputs = self.tokenizer(raw_diverse_prompt, return_tensors="pt", add_special_tokens=False)
+            diverse_input_ids = diverse_model_inputs.pop("input_ids")
+            diverse_attention_mask = diverse_model_inputs.pop("attention_mask")
+
+            diverse_input_ids, diverse_attention_mask = verl_F.postprocess_data(
+                input_ids=diverse_input_ids,
+                attention_mask=diverse_attention_mask,
+                max_length=self.max_prompt_length + 1024,
+                pad_token_id=self.tokenizer.pad_token_id,
+                left_pad=True,
+                truncation=self.truncation,
+            )
+            diverse_position_ids = compute_position_id_with_mask(diverse_attention_mask)
+            row_dict["diverse_input_ids"] = diverse_input_ids
+            row_dict["diverse_attention_mask"] = diverse_attention_mask
+            row_dict["diverse_position_ids"] = diverse_position_ids
         return row_dict
 
     def __getstate__(self):
